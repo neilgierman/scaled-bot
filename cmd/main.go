@@ -18,6 +18,7 @@ import (
 	"flag"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -25,37 +26,18 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/klog/v2"
 )
 
-func buildConfig(kubeconfig string) (*rest.Config, error) {
-	if kubeconfig != "" {
-		cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
-		if err != nil {
-			return nil, err
-		}
-		return cfg, nil
-	}
-
-	cfg, err := rest.InClusterConfig()
-	if err != nil {
-		return nil, err
-	}
-	return cfg, nil
-}
-
 func main() {
 	klog.InitFlags(nil)
 
-	var kubeconfig string
 	var leaseLockName string
 	var leaseLockNamespace string
 	var id string
 
-	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
 	flag.StringVar(&id, "id", uuid.New().String(), "the holder identity name")
 	flag.StringVar(&leaseLockName, "lease-lock-name", "bot", "the lease lock resource name")
 	flag.StringVar(&leaseLockNamespace, "lease-lock-namespace", "default", "the lease lock resource namespace")
@@ -73,7 +55,7 @@ func main() {
 	// a ConfigMap, or an Endpoints (deprecated) object.
 	// Conflicting writes are detected and each client handles those actions
 	// independently.
-	config, err := buildConfig(kubeconfig)
+	config, err := rest.InClusterConfig()
 	if err != nil {
 		klog.Fatal(err)
 	}
@@ -82,8 +64,24 @@ func main() {
 	run := func(ctx context.Context) {
 		// complete your controller loop here
 		klog.Info("Controller loop...")
+		// peg CPUs for 2min to test scaling
 
-		select {}
+		done := make(chan int)
+
+		for i := 0; i < runtime.NumCPU(); i++ {
+			go func() {
+				for {
+					select {
+					case <-done:
+						return
+					default:
+					}
+				}
+			}()
+		}
+
+		time.Sleep(time.Minute * 2)
+		close(done)	
 	}
 
 	// use a Go context so we can tell the leaderelection code when we

@@ -23,7 +23,7 @@ create-cluster:
 
 delete-cluster:
 	k3d cluster delete quake
-	docker network rm k3d-quake
+	-docker network rm k3d-quake
 
 clean:
 	rm -f cmd/bot

@@ -20,3 +20,7 @@ spec:
       containers:
       - name: master
         image: k3d-quake-registry:5000/bot:latest
+        resources:
+          requests:
+            cpu: 500m
+            memory: 64Mi
