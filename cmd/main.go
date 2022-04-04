@@ -15,14 +15,16 @@ package main
 
 import (
 	"context"
-	"flag"
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"syscall"
 	"time"
 
+	"github.com/go-redis/redis"
 	"github.com/google/uuid"
+	"github.com/keithwachira/go-taskq"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -31,24 +33,37 @@ import (
 	"k8s.io/klog/v2"
 )
 
+const (
+	streamName = "bot_jobs"
+)
+
 func main() {
 	klog.InitFlags(nil)
 
-	var leaseLockName string
-	var leaseLockNamespace string
-	var id string
+	//we start by creating a new go-redis client
+	//that we will use to access our redis instance
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     "redis-master:6379",
+		Password: "",
+		DB:       0, // use default DB
+	})
 
-	flag.StringVar(&id, "id", uuid.New().String(), "the holder identity name")
-	flag.StringVar(&leaseLockName, "lease-lock-name", "bot", "the lease lock resource name")
-	flag.StringVar(&leaseLockNamespace, "lease-lock-namespace", "default", "the lease lock resource namespace")
-	flag.Parse()
+	for i := 0; i < 60; i++ {
+		if rdb.Ping().Err() == nil {
+			klog.Info("redis responding")
+			break
+		}
+		klog.Info("waiting for redis")
+		time.Sleep(time.Second * 2)
+	}
 
-	if leaseLockName == "" {
-		klog.Fatal("unable to get lease lock resource name (missing lease-lock-name flag).")
-	}
-	if leaseLockNamespace == "" {
-		klog.Fatal("unable to get lease lock resource namespace (missing lease-lock-namespace flag).")
-	}
+	//start processing any received job in redis
+	//you can see the definition of this function below
+	go StartProcessingEmails(rdb)
+
+	leaseLockName := "bot"
+	leaseLockNamespace := "default"
+	id := uuid.New().String()
 
 	// leader election uses the Kubernetes API by writing to a
 	// lock object, which can be a LeaseLock object (preferred),
@@ -64,24 +79,17 @@ func main() {
 	run := func(ctx context.Context) {
 		// complete your controller loop here
 		klog.Info("Controller loop...")
-		// peg CPUs for 2min to test scaling
 
-		done := make(chan int)
-
-		for i := 0; i < runtime.NumCPU(); i++ {
-			go func() {
-				for {
-					select {
-					case <-done:
-						return
-					default:
-					}
-				}
-			}()
-		}
-
+		klog.Info("Sleeping for 2 minutes before populating queue...")
 		time.Sleep(time.Minute * 2)
-		close(done)	
+		klog.Info("Creating 20 jobs...")
+		for i := 1; i <= 20; i++ {
+			if err := rdb.RPush(streamName, strconv.Itoa(i)).Err(); err != nil {
+				klog.Errorf("could not add data to queue: %w", err)
+			}
+
+			klog.Infof("%d added to queue", i)
+		}
 	}
 
 	// use a Go context so we can tell the leaderelection code when we
@@ -147,4 +155,72 @@ func main() {
 			},
 		},
 	})
+}
+
+// RedisStreamsProcessing
+//you can also pass a database here too
+//if you need it to process you work
+type RedisStreamsProcessing struct {
+	Redis *redis.Client
+	//other dependencies e.g. logger database goes here
+}
+
+// Process this method implements JobCallBack
+///it will read and process each id
+func (r *RedisStreamsProcessing) Process(job interface{}) {
+	id := job.(string)
+	klog.Infof("Processing ID %s", id)
+
+	// peg CPUs for 2min to test scaling
+	done := make(chan int)
+
+	for i := 0; i < runtime.NumCPU(); i++ {
+		go func() {
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+			}
+		}()
+	}
+
+	time.Sleep(time.Minute * 2)
+	close(done)
+
+	// If we had a problem, we can add the message back to the queue
+	/*
+		r.Redis.XAdd(context.Background(), &redis.XAddArgs{
+				Stream: streamName,
+				MaxLen: 0,
+				ID: "",
+				Values: data.Values,
+			})
+	*/
+}
+
+func StartProcessingEmails(rdb *redis.Client) {
+	//create a new consumer instance to process the job
+	//and pass it to our task queue
+	redisStreams := RedisStreamsProcessing{
+		Redis: rdb,
+	}
+	//in this case we have started 5 goroutines so at any moment we will
+	//be sending a maximum of 5 emails.
+	//you can adjust these parameters to increase or reduce
+	q := taskq.NewQueue(1, 1, redisStreams.Process)
+	//call startWorkers  in a different goroutine otherwise it will block
+	go q.StartWorkers()
+	//with our workers running now we can start listening to new events from redis stream
+	//we start from id 0 i.e. the first item in the stream
+	for {
+		result, err := rdb.BLPop(0, streamName).Result()
+		if err != nil {
+			klog.Errorf("failed poping message: %w", err)
+		}
+		///we have received the data we should loop it and queue the messages
+		//so that our jobs can start processing
+		q.EnqueueJobBlocking(result[1])
+	}
 }
